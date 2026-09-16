@@ -4,43 +4,36 @@
 
 X's official API tiers that support search are paid; the assignment explicitly rules
 out paid APIs and the Twitter API. That leaves browser automation as the only option,
-which is why the assignment note itself suggests Selenium.
-
 X requires an authenticated session to view live search results, so the scraper needs
-*some* logged-in session before it can search at all. Two modes are supported (see
-README.md "Login setup"):
-- **Persistent profile** (recommended): the operator logs in once, manually, in a
-  dedicated Chrome profile; the scraper reuses that session and never submits
-  credentials itself.
-- **Direct credentials**: `src/scraper/twitter_scraper.py` logs in with the operator's
-  own credentials (read from environment variables, never hardcoded).
+*some* logged-in session before it can search at all. Rather than automating the
+login form itself, the operator logs in once, manually, in a dedicated Chrome profile
+(see README.md "Log into X in a dedicated Chrome profile"); the scraper reuses that
+session (`scraper.user_data_dir` in `config.yaml`) and never reads or submits
+credentials. An earlier version did support automating the login form directly (via
+environment-variable credentials), but a real account was flagged by X's automation
+detection ("We've temporarily limited your login") on essentially the first attempt
+during development, despite the rate-limiting/fingerprint-reduction measures below -
+that mode was removed in favor of the persistent-profile approach, which moves the
+actual authentication event to a normal, manual, human login instead.
 
-Either way, once authenticated, the scraper paginates a hashtag search page by
-scrolling and parsing the rendered tweet cards.
+Once authenticated, the scraper paginates a hashtag search page by scrolling and
+parsing the rendered tweet cards.
 
 **Anti-bot / rate-limit handling** (deliberately conservative, not adversarial):
 - A token-bucket rate limiter (`TokenBucketRateLimiter`, deque-based) caps actions per
   rolling time window.
 - Randomized delays between scroll actions avoid a fixed, easily fingerprinted cadence.
-- `--disable-blink-features=AutomationControlled` and a realistic user-agent remove the
-  most obvious automation fingerprints.
-- Session cookies are persisted so repeated runs re-use a login instead of hitting the
-  login flow (and its own bot checks) every time.
-- If the page shows a rate-limit/anti-bot marker (`selectors.RATE_LIMIT_MARKERS`), the
-  scraper backs off exponentially with jitter rather than retrying immediately.
+- `--disable-blink-features=AutomationControlled` and disabling Chrome's own
+  automation-extension/infobar remove the most obvious automation fingerprints.
+- If the page shows a rate-limit/anti-bot marker (`selectors.RATE_LIMIT_MARKERS`) *and*
+  no tweets are currently rendered (a genuine block replaces the feed entirely, unlike
+  an incidental phrase match inside ordinary tweet text), the scraper backs off
+  exponentially with jitter rather than retrying immediately.
 
 This reduces detection risk; it does not defeat CAPTCHAs or eliminate the risk of an
-account being challenged. That's a deliberate scope boundary, not an oversight.
-
-**Empirical finding, not just a theoretical caveat**: during development, a direct-
-credentials login attempt against a real account was flagged by X's automation
-detection ("We've temporarily limited your login") on essentially the first attempt,
-despite the rate-limiting/backoff/fingerprint-reduction measures above. This is the
-reason the persistent-profile login mode was added afterward - moving the actual
-authentication event to a normal, manual, human login meaningfully reduces (but, per
-the paragraph above, does not eliminate) this risk, since the automated portion of the
-session no longer includes submitting credentials at all. Anyone extending this
-scraper should budget for this happening again rather than treat it as unlikely.
+account being challenged - not just a theoretical caveat, given the account-lock
+above. Anyone extending this scraper should budget for that happening again rather
+than treat it as unlikely.
 
 ## 2. Data structures and their complexity
 
@@ -50,7 +43,7 @@ scraper should budget for this happening again rather than treat it as unlikely.
 | Bloom filter (`bytearray` bit array) | Exact-dedup pre-check | Sub-linear memory (a few bits/item) vs. storing full tweet text; no false negatives | O(k) per check, k = hash count (~7-10) |
 | `set` of SHA-256 hashes | Exact-dedup confirmation | O(1) average lookup/insert; only consulted after a bloom-filter hit, so it's rarely the bottleneck | O(1) average |
 | MinHash signature buckets, banded (`list[dict[tuple, list]]`) | Near-duplicate detection | Naive near-dup detection compares every new tweet's shingle set against every previous one (O(n²) over a run). Banded MinHash buckets limit comparisons to items already likely similar, without requiring every hash function to agree at once | O(1) amortized per check, assuming reasonable bucket sizes |
-| `heapq`-free top-K via pandas `nlargest` (see `aggregator.py` sorting) | Ranking hashtags by volume | Avoids a full sort when only ordering matters for display | O(n log k) if extended to true top-K; O(n log n) as currently written for full ordering of 4 hashtags (n is tiny here, so simplicity wins over asymptotics) |
+| pandas `sort_values` (see `aggregator.py`'s final ordering step) | Ranking hashtags by composite signal volume | A full sort, not a top-k selection - deliberately simple, since there are only ever as many rows as configured hashtags (a handful), where a `heapq`/partial-selection approach would add complexity for no measurable benefit | O(n log n), n = number of hashtags (irrelevant in practice at this n; would be worth revisiting only if ranking across hundreds of groups) |
 | Parquet (columnar, partitioned by date) | Storage | Columnar compression suits repeated-value columns (hashtags, query_tag); date partitioning lets future large-scale reads skip irrelevant files entirely | I/O roughly proportional to partitions touched, not total rows |
 
 ## 3. Deduplication design in more detail
@@ -123,11 +116,15 @@ tweets score exactly 0 - no lexicon hits at all).
   item count to keep the false-positive rate low; MinHash bucketing complexity is
   roughly independent of total corpus size as long as bucket occupancy stays bounded.
 - **Signal extraction**: `TfidfVectorizer(max_features=...)` bounds vocabulary size
-  regardless of corpus size; for a truly large corpus, `ParquetStore.iter_batches()`
-  already supports processing in chunks rather than loading everything into one
-  DataFrame - `run_pipeline.py` would need to switch from `read_all()` to a
-  batch-wise fit/transform (e.g. `HashingVectorizer`, which needs no vocabulary
-  fitting pass at all).
+  regardless of corpus size; for a truly large corpus, `run_pipeline.py` would need to
+  switch from loading the whole run into one DataFrame to a batch-wise fit/transform
+  over `ParquetStore.iter_batches()` (e.g. `HashingVectorizer`, which needs no
+  vocabulary-fitting pass at all). Note that `iter_batches()` (and `read_all()`) can
+  read either one specific parquet file or every file in `processed_dir` - the latter
+  is for deliberate cumulative analysis across many past runs, not what a single run's
+  own report should do (mixing in unrelated historical files there was a real bug
+  during development, since fixed - `run_pipeline.py` now reads back only its own
+  run's file).
 - **Concurrency**: the four hashtag searches in `run_scraper.py` are deliberately
   sequential - concurrent browser sessions would multiply the anti-bot detection
   surface, and section 1's empirical account-lock finding is exactly why that
