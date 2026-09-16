@@ -118,10 +118,6 @@ def run(input_path: str, config_path: str = "config/config.yaml") -> None:
     parquet_path = store.write(unique_records, run_id=run_id)
     logger.info("Wrote %d records -> %s", len(unique_records), parquet_path)
 
-    # Reads back only *this* run's own file, not store.read_all() - which
-    # would silently pull in every other parquet file ever written to
-    # processed_dir (past runs, including ones over overlapping/duplicate
-    # source data) and inflate every downstream count and chart.
     df = pd.read_parquet(parquet_path)
 
     analysis_cfg = config["analysis"]
