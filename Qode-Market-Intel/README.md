@@ -1,0 +1,245 @@
+# Qode Market Intel
+
+A data collection and analysis system that turns Indian stock-market discussion on
+X (Twitter) into quantitative trading signals - built for the Qode technical assignment.
+
+## ⚠️ Important note on scope
+
+X's Terms of Service prohibit automated scraping of the site, and X now requires an
+authenticated session to view search results at all. This repository implements the
+**full pipeline** end to end (scraper, cleaning, deduplication, Parquet storage,
+TF-IDF/lexicon signal extraction, aggregation with confidence intervals, and
+memory-efficient visualization), but the scraper itself (`scripts/run_scraper.py`)
+must be run **locally, with your own X account** - it cannot be run unattended in a
+CI/sandbox environment (no CAPTCHA/2FA solving is attempted, and none should be).
+
+To let the rest of the pipeline be verified without live credentials,
+`scripts/generate_sample_data.py` produces a synthetic dataset shaped exactly like the
+scraper's output (same fields, realistic hashtag/engagement/timestamp distributions,
+injected duplicates, and mixed English/Hindi content) and `data/sample/` /
+`reports/` contain a pre-generated run of it end to end. Swap in real scraped JSON and
+every downstream step (cleaning, dedup, storage, signals, plots) works unchanged.
+
+## Project structure
+
+```
+config/config.yaml          Central configuration (hashtags, rate limits, thresholds, login mode)
+src/scraper/                 Selenium scraper, rate limiter, DOM selectors
+src/processing/              Cleaning, deduplication (bloom filter + MinHash/LSH), Parquet storage
+src/analysis/                 TF-IDF + lexicon signal extraction, aggregation, visualization
+scripts/run_scraper.py       Live scrape (requires your own X login, run locally)
+scripts/generate_sample_data.py   Synthetic sample data generator
+scripts/run_pipeline.py      clean -> dedup -> store -> analyze -> visualize (merges batches)
+tests/                        pytest unit tests
+docs/TECHNICAL_APPROACH.md   Design rationale, complexity analysis, scalability plan
+data/sample/                  Sample raw JSON input (synthetic, committed)
+reports/                      Committed deliverable: composite_signals.csv, PNG charts,
+                               sample_processed_tweets.parquet (cleaned/deduped output)
+```
+
+## Setup
+
+```bash
+python -m venv .venv
+.venv\Scripts\Activate.ps1     # PowerShell; use .venv\Scripts\activate.bat for cmd.exe
+python -m pip install -r requirements.txt
+```
+
+Live scraping additionally needs Google Chrome installed (the scraper auto-downloads
+a matching ChromeDriver via `webdriver-manager`).
+
+> **Moved or renamed this folder?** A venv bakes absolute paths into its launcher
+> scripts (`pip.exe` especially). If `pip install ...` fails with `Fatal error in
+> launcher: Unable to create process`, use `python -m pip install ...` instead (bypasses
+> the broken launcher), or just delete `.venv` and recreate it fresh at the new path.
+
+## Login setup
+
+The scraper needs an authenticated X session to view search results at all. It never
+reads or submits credentials itself - you log in once, manually, in a dedicated
+Chrome profile, and the scraper just reuses that already-authenticated session. This
+avoids the single riskiest action for tripping X's anti-automation detection (an
+automated login submission), because the real authentication event looks like a
+normal human login. (An earlier version supported direct-credential login via `.env`
+instead; that was removed after it triggered a real account lock during development -
+see `docs/TECHNICAL_APPROACH.md` for the write-up.)
+
+1. **Fully quit every Chrome window/process first.** Chrome's "singleton instance"
+   behavior means if *any* Chrome process is still running anywhere (even in the
+   background/system tray), launching it again just forwards the request to that
+   existing instance and **ignores** the profile flag below - a very easy way to think
+   you're in a fresh profile when you're actually still in your normal one. Confirm
+   it's actually empty:
+   ```bash
+   tasklist /FI "IMAGENAME eq chrome.exe"
+   ```
+   It should say "No tasks are running which match the specified criteria." If it
+   lists anything, end those in Task Manager (or `taskkill /F /IM chrome.exe /T`,
+   which closes **all** Chrome windows - save anything open first) and re-check.
+
+2. **Launch Chrome pointed at a brand-new, dedicated profile folder:**
+   ```bash
+   & "C:\Program Files\Google\Chrome\Application\chrome.exe" --user-data-dir="D:\SeleniumProfile"
+   ```
+   (pick any empty path you like; this example matches `config.yaml`'s default)
+
+3. **Confirm you're actually in that isolated profile** - it should look bare (no
+   extensions, no bookmarks, no existing Google sign-in). Type `chrome://version` in
+   the address bar; "Profile Path" should read `D:\SeleniumProfile\Default`. If it
+   looks like your normal browser instead, step 1 wasn't actually clean - go back and
+   fully quit Chrome again.
+
+4. **Log into X normally in that window** - type it in yourself, wait for the home
+   feed to fully load with real tweets (title should read "Home / X", not the
+   logged-out "X. It's what's happening / X").
+
+5. **Close that Chrome window completely.**
+
+6. **Set `config/config.yaml`:**
+   ```yaml
+   scraper:
+     user_data_dir: "D:\\SeleniumProfile"
+     profile_directory: ""
+   ```
+
+7. Run the scraper (see Usage below) - it checks the profile is already logged in
+   and refuses to start with a clear error if it isn't (rather than a confusing
+   scrape-returns-nothing failure).
+
+**Use a throwaway account for this, not your main one, especially at first.** X's
+automation detection can flag even a careful setup (see Troubleshooting below for
+exactly what that looks like) - a throwaway account absorbs that risk instead of a
+personal one.
+
+## Usage
+
+### 1. Sample data (no login needed at all)
+
+```bash
+python scripts/generate_sample_data.py --count 2200 --seed 42
+python scripts/run_pipeline.py --input data/sample/raw_sample.json
+```
+
+This writes `reports/composite_signals.csv` and three PNG charts from synthetic data
+shaped like the real scraper's output - useful to sanity-check the analysis half of
+the pipeline independent of X entirely.
+
+### 2. One go: a single run covering everything
+
+```bash
+python scripts/run_scraper.py --out data/raw/raw_scrape.json
+python scripts/run_pipeline.py --input data/raw/raw_scrape.json
+```
+
+Uses `config.yaml`'s defaults (`target_tweets`, all 4 `hashtags`). Expect this to take
+a while - it deliberately rate-limits itself to look human rather than fire requests
+as fast as possible - so don't interrupt the browser window while it's running.
+
+### 3. Batches: shorter runs spread out over time (recommended over one long run)
+
+Splitting the target across several shorter, separated runs is not just about
+patience - a long unbroken automated session is itself a pattern worth avoiding, so
+natural breaks between batches are a genuine (if small) safety improvement, not only
+a convenience:
+
+```bash
+python scripts/run_scraper.py --tags "#nifty50"   --limit 500 --out data/raw/batch1.json
+python scripts/run_scraper.py --tags "#sensex"    --limit 500 --out data/raw/batch2.json
+python scripts/run_scraper.py --tags "#intraday"  --limit 500 --out data/raw/batch3.json
+python scripts/run_scraper.py --tags "#banknifty" --limit 500 --out data/raw/batch4.json
+```
+
+Then merge everything at analysis time - duplicate/overlapping tweets across batches
+are handled automatically by the same dedup pipeline used within a single run:
+```bash
+python scripts/run_pipeline.py --input "data/raw/batch*.json"
+# equivalently: --input "data/raw/batch1.json,data/raw/batch2.json,data/raw/batch3.json,data/raw/batch4.json"
+```
+
+`--tags` and `--limit` also work as a quick smoke test before committing to a full
+run - e.g. `--tags "#nifty50" --limit 2` to check login and scraping both work before
+scaling up.
+
+### 4. Run tests
+
+```bash
+pytest -q
+```
+
+## Troubleshooting
+
+Issues actually hit while building this out, in case they recur:
+
+- **`Fatal error in launcher` after moving/renaming the project folder** - the venv's
+  `pip.exe` has an absolute path baked in. Use `python -m pip install ...` instead, or
+  recreate `.venv` fresh.
+- **`ModuleNotFoundError: No module named 'selenium'`** (or `webdriver_manager`,
+  `yaml`, etc.) - `pip install -r requirements.txt` wasn't run in this venv yet.
+- **Login form times out / "X may have changed its DOM"** - X ships several login-flow
+  variants; `src/scraper/selectors.py` tries a short list of known field selectors, but
+  a new one may need adding. The scraper saves a screenshot + page title/URL to
+  `logs/` on this failure (see `_debug_dump` in `twitter_scraper.py`) instead of
+  failing silently - check that before guessing.
+- **"We've temporarily limited your login"** - X's anti-automation detection flagged
+  the login attempt. **Stop retrying immediately** - repeated attempts risk a longer
+  hold or a full review. Unlock it manually (normal browser, no automation) via
+  whatever verification X asks for, then avoid automating that account again for a
+  while. This is why Option A (persistent profile) exists - it removes the automated
+  login submission that's most likely to trigger this.
+- **`SessionNotCreatedException: Chrome instance exited`** when using
+  `scraper.user_data_dir` - almost always a leftover Chrome process (a crashed or
+  still-running prior scraper session) holding a lock on that profile folder; two
+  Chrome instances can't share one profile. The scraper now checks for this itself
+  before attempting to launch and raises a clear error naming the exact PID to kill
+  (`taskkill /F /PID <pid> /T`) instead of this opaque crash.
+- **Scraped content is unrelated to the searched hashtag** - historically caused by an
+  unescaped `#` in the search URL (`search?q=#nifty50` puts everything from `#`
+  onward into the URL *fragment*, not the query string, so X received an empty
+  search). Fixed by URL-encoding the query (`urllib.parse.quote`) - `#nifty50` now
+  correctly becomes `%23nifty50` in the request.
+- **It's slow** - two independent levers, safe to combine: (1) lower
+  `scraper.target_tweets` in `config.yaml` - a direct linear time cut; (2)
+  `scraper.rate_limit_check_interval` controls how often the scraper dumps and scans
+  the entire page DOM to check for a rate-limit page - this was happening every single
+  scroll and was the single biggest per-iteration cost; checking every few iterations
+  instead costs negligible detection latency (a real rate-limit page persists across
+  many iterations once it appears) for a large wall-clock improvement. Avoid the
+  temptation to shorten `scroll_pause_range` instead - that's the human-pacing delay,
+  and shortening it is exactly the kind of change that increases detection risk.
+
+## Design highlights
+
+- **Rate limiting**: a deque-based token bucket (`src/scraper/rate_limiter.py`) bounds
+  actions per rolling time window in O(1) amortized time, plus randomized human-paced
+  delays and exponential backoff with jitter when an anti-bot page is detected.
+- **Deduplication** (`src/processing/deduplicator.py`): a Bloom filter pre-check backed
+  by an exact hash set catches identical tweets in O(1); a MinHash/LSH bucketing scheme
+  (banded across 12 single-hash bands for high recall) catches near-duplicates
+  (retweets-with-comment, lightly reworded reposts) without the O(n²) cost of
+  comparing every tweet to every other tweet - and merges cleanly across multiple
+  scraper batch files, not just within one run.
+  See `docs/TECHNICAL_APPROACH.md` for the complexity breakdown.
+- **Storage**: Parquet, partitioned by collection date, via `pyarrow` - columnar,
+  compressed, and prunable by date range as the dataset grows.
+- **Signals**: TF-IDF vector magnitude (unnormalized - see note in
+  `src/analysis/signals.py` on why the default L2 normalization would make this
+  feature constant) + a custom bullish/bearish finance lexicon (tuned for
+  Indian-market phrasing: "upper circuit", "lower circuit", etc.) combined into an
+  engagement-weighted composite sentiment score per hashtag, with a bootstrap
+  confidence interval (distribution-free, since lexicon scores are bounded and often
+  spike at zero).
+- **Visualization**: aggregates are plotted directly; any plot over raw per-tweet data
+  uses reservoir sampling so peak memory is independent of dataset size.
+- **Unicode**: NFC normalization + zero-width-character stripping so Hindi/Devanagari
+  and other Indic-script content hashes and compares consistently.
+
+## Known limitations
+
+- X's DOM/selectors (`src/scraper/selectors.py`) change periodically; the scraper's
+  selector constants may need updating when that happens.
+- Rate limiting, human-paced delays, and the persistent-profile login mode all reduce,
+  but cannot guarantee, avoidance of anti-bot detection - this project does not
+  attempt to solve CAPTCHAs, and a real account lock was hit and documented above
+  during development.
+- The sample dataset is synthetic; it demonstrates the pipeline's correctness, not a
+  real market read. Real signal quality depends on running the live scraper.
