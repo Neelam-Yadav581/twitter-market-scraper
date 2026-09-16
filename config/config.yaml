@@ -1,0 +1,62 @@
+scraper:
+  hashtags:
+    - "#nifty50"
+    - "#sensex"
+    - "#intraday"
+    - "#banknifty"
+  target_tweets: 2000
+  max_scroll_attempts: 500
+  headless: false
+  window_size: [1366, 900]
+  page_load_timeout: 30
+  scroll_pause_range: [1.5, 3.5]
+  rate_limit_check_interval: 4
+  rate_limit:
+    max_actions_per_window: 30
+    window_seconds: 60
+    backoff_base_seconds: 5
+    backoff_max_seconds: 300
+  user_data_dir: "D:\\SeleniumProfile"
+  profile_directory: ""
+storage:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  parquet_compression: "snappy"
+
+processing:
+  bloom_filter:
+    capacity: 200000
+    error_rate: 0.001
+  near_duplicate_threshold: 0.6
+
+analysis:
+  tfidf:
+    max_features: 5000
+    ngram_range: [1, 2]
+    min_df: 2
+  bullish_lexicon:
+    - "breakout"
+    - "buy"
+    - "upper circuit"
+    - "rally"
+    - "bullish"
+    - "long"
+    - "target hit"
+    - "support held"
+    - "strong"
+  bearish_lexicon:
+    - "breakdown"
+    - "sell"
+    - "lower circuit"
+    - "crash"
+    - "bearish"
+    - "short"
+    - "stop loss hit"
+    - "resistance"
+    - "panic"
+  confidence_level: 0.95
+  bootstrap_samples: 500
+
+logging:
+  level: "INFO"
+  file: "logs/app.log"
