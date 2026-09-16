@@ -140,10 +140,3 @@ tweets score exactly 0 - no lexicon hits at all).
   extraction could extend the same pattern per-partition once corpus size makes it
   worthwhile; at the current scale, TF-IDF fitting itself is the cheaper step.
 
-## 7. Ethical / ToS note
-
-Automated scraping of X without its paid API is against X's Terms of Service. This
-project is built for educational/personal-research purposes as specified by the
-assignment ("no paid APIs allowed... consider using Selenium"). Anyone running the
-live scraper should use their own account, keep the built-in rate limiting intact,
-and avoid redistributing or commercializing collected data.
